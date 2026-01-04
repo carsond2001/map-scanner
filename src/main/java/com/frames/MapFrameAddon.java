@@ -9,6 +9,7 @@ public class MapFrameAddon extends MeteorAddon {
         System.out.println("Initializing MapFrame Addon");
         //Modules.get().add(new MapFrameFarmer());
         Modules.get().add(new MapRgbScanner());
+        Modules.get().add(new SignScanner());
 
     }
 
