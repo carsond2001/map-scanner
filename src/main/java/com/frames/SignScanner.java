@@ -11,6 +11,7 @@ import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.entity.BlockEntity;
@@ -20,6 +21,7 @@ import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -39,6 +41,13 @@ public class SignScanner extends Module {
 
     private final Set<String> scanned = new HashSet<>();
     private int tickCounter = 0;
+
+    private final Setting<String> outputFolder = sgGeneral.add(new StringSetting.Builder()
+        .name("output-folder")
+        .description("Folder under the Minecraft game directory to store archives (ex: mapframe_archive).")
+        .defaultValue("mapframe_archive")
+        .build()
+    );
 
     private final Setting<String> webhookUrl = sgGeneral.add(new StringSetting.Builder()
         .name("webhook-url")
@@ -76,7 +85,7 @@ public class SignScanner extends Module {
 
     private final Setting<Integer> maxSignsPerScan = sgGeneral.add(new IntSetting.Builder()
         .name("max-signs-per-scan")
-        .description("Max new signs to send per scan.")
+        .description("Max new signs to process per scan.")
         .defaultValue(25)
         .min(1)
         .sliderMax(200)
@@ -92,7 +101,7 @@ public class SignScanner extends Module {
 
     private final Setting<Boolean> rescanOnEnable = sgGeneral.add(new BoolSetting.Builder()
         .name("rescan-on-enable")
-        .description("Clear cache on enable.")
+        .description("Clear in-memory cache on enable.")
         .defaultValue(true)
         .build()
     );
@@ -102,13 +111,37 @@ public class SignScanner extends Module {
             Categories.Render,
             "sign-scanner",
             "Sign Scanner",
-            "Scans nearby signs and sends their text to a Discord webhook."
+            "Scans nearby signs, archives them to SQLite, and optionally sends to a Discord webhook."
         );
     }
 
     private static class SignJob {
-        final String message;
-        SignJob(String message) { this.message = message; }
+        final long firstSeenMs;
+        final BlockPos pos;
+        final String front;
+        final String back;
+        final String contentKey;
+        final String dimension;
+        final String server;
+        final String discordMessage;
+
+        SignJob(long firstSeenMs, BlockPos pos, String front, String back,
+                String contentKey, String dimension, String server, String discordMessage) {
+            this.firstSeenMs = firstSeenMs;
+            this.pos = pos;
+            this.front = front;
+            this.back = back;
+            this.contentKey = contentKey;
+            this.dimension = dimension;
+            this.server = server;
+            this.discordMessage = discordMessage;
+        }
+    }
+
+    private Path getSignDbPath() {
+        Path gameDir = FabricLoader.getInstance().getGameDir();
+        String folder = outputFolder.get().trim().isEmpty() ? "mapframe_archive" : outputFolder.get().trim();
+        return gameDir.resolve(folder).resolve("sign_archive.sqlite");
     }
 
     @Override
@@ -117,13 +150,29 @@ public class SignScanner extends Module {
 
         if (rescanOnEnable.get()) scanned.clear();
 
+        try {
+            Path dbPath = getSignDbPath();
+            SignArchiveDb.init(dbPath);
+            info("Sign DB ready: " + dbPath.toAbsolutePath());
+        } catch (Exception e) {
+            e.printStackTrace();
+            warning("Failed to init SignArchiveDb (see logs).");
+        }
+
         if (webhookUrl.get().isBlank()) {
-            warning("Webhook URL is empty. Signs will be scanned but NOT sent.");
+            warning("Webhook URL is empty. Signs will be scanned and archived but NOT sent.");
         } else if (!looksLikeDiscordWebhook(webhookUrl.get())) {
             warning("Webhook URL doesn't look like a Discord webhook. Sending may fail.");
         }
 
         info("Sign Scanner enabled.");
+    }
+
+    @Override
+    public void onDeactivate() {
+        super.onDeactivate();
+        // Optional: close DB when module disabled
+        SignArchiveDb.close();
     }
 
     @EventHandler
@@ -138,7 +187,6 @@ public class SignScanner extends Module {
         int yMin = mc.player.getBlockY() - v;
         int yMax = mc.player.getBlockY() + v;
 
-
         BlockPos playerPos = mc.player.getBlockPos();
         BlockPos.Mutable pos = new BlockPos.Mutable();
 
@@ -147,7 +195,6 @@ public class SignScanner extends Module {
         outer:
         for (int dx = -r; dx <= r; dx++) {
             for (int dz = -r; dz <= r; dz++) {
-                // horizontal circle cut (skip corners)
                 if (dx * dx + dz * dz > rSq) continue;
 
                 int x = playerPos.getX() + dx;
@@ -157,8 +204,6 @@ public class SignScanner extends Module {
                     pos.set(x, y, z);
 
                     BlockState state = mc.world.getBlockState(pos);
-
-                    // Only proceed if it is tagged as a sign
                     if (!state.isIn(BlockTags.SIGNS)) continue;
 
                     BlockEntity be = mc.world.getBlockEntity(pos);
@@ -169,12 +214,31 @@ public class SignScanner extends Module {
 
                     if (front.isBlank() && back.isBlank()) continue;
 
-                    // De-dupe by position + content
                     String key = pos.asLong() + "|" + front + "|" + back;
                     if (!scanned.add(key)) continue;
 
-                    String msg = formatDiscordMessage(pos.toImmutable(), front, back);
-                    jobs.add(new SignJob(msg));
+                    BlockPos immutablePos = pos.toImmutable();
+
+                    String dim = (mc.world.getRegistryKey() != null)
+                        ? mc.world.getRegistryKey().getValue().toString()
+                        : null;
+
+                    String srv = (mc.getCurrentServerEntry() != null)
+                        ? mc.getCurrentServerEntry().address
+                        : "singleplayer";
+
+                    String msg = formatDiscordMessage(immutablePos, front, back);
+
+                    jobs.add(new SignJob(
+                        System.currentTimeMillis(),
+                        immutablePos,
+                        front,
+                        back,
+                        key,
+                        dim,
+                        srv,
+                        msg
+                    ));
 
                     if (jobs.size() >= maxSignsPerScan.get()) break outer;
                 }
@@ -184,26 +248,55 @@ public class SignScanner extends Module {
         if (jobs.isEmpty()) return;
 
         String url = webhookUrl.get().trim();
+
         if (url.isEmpty()) {
-            info("Found " + jobs.size() + " new sign(s). (Not sending — webhook-url is blank.)");
-            return;
+            info("Found " + jobs.size() + " new sign(s); archiving locally (webhook-url blank, not sending).");
+        } else {
+            info("Found " + jobs.size() + " new sign(s); archiving + sending in background.");
         }
 
-        info("Found " + jobs.size() + " new sign(s); sending to Discord in background.");
         EXECUTOR.submit(() -> processJobs(jobs, url));
     }
 
     private void processJobs(List<SignJob> jobs, String url) {
+        int stored = 0;
         int sent = 0;
+
+        // Ensure DB open in worker thread too
+        try {
+            SignArchiveDb.init(getSignDbPath());
+        } catch (Exception e) {
+            e.printStackTrace();
+            return;
+        }
+
         for (SignJob job : jobs) {
             try {
-                DiscordWebhookSender.sendMessage(url, job.message);
-                sent++;
+                SignArchiveDb.insertSign(
+                    job.firstSeenMs,
+                    job.dimension,
+                    job.server,
+                    job.pos,
+                    job.front,
+                    job.back,
+                    job.contentKey
+                );
+                stored++;
             } catch (Exception ex) {
                 ex.printStackTrace();
             }
+
+            if (url != null && !url.isBlank()) {
+                try {
+                    DiscordWebhookSender.sendMessage(url, job.discordMessage);
+                    sent++;
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            }
         }
-        if (sent > 0) System.out.println("[SignScanner] Sent " + sent + " sign(s) to Discord.");
+
+        System.out.println("[SignScanner] Stored " + stored + " sign(s); sent " + sent + " to Discord.");
     }
 
     private String formatDiscordMessage(BlockPos pos, String front, String back) {
@@ -235,7 +328,6 @@ public class SignScanner extends Module {
     private String signTextToPlain(SignText st) {
         if (st == null) return "";
         StringBuilder sb = new StringBuilder();
-
         for (int i = 0; i < 4; i++) {
             Text t = st.getMessage(i, false);
             String line = (t == null) ? "" : t.getString();

@@ -11,6 +11,7 @@ import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.entity.decoration.ItemFrameEntity;
 import net.minecraft.item.FilledMapItem;
@@ -19,12 +20,15 @@ import net.minecraft.item.map.MapState;
 import net.minecraft.block.MapColor;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.MapIdComponent;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+
 
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import javax.imageio.ImageIO;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -43,6 +47,15 @@ public class MapRgbScanner extends Module {
     private final MinecraftClient mc = MinecraftClient.getInstance();
     private final Set<String> scannedMaps = new HashSet<>();
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
+
+    private ScanDb db;
+
+    private final Setting<String> outputFolder = sgGeneral.add(new StringSetting.Builder()
+        .name("output-folder")
+        .description("Folder under the Minecraft game directory to store archives (ex: mapframe_archive).")
+        .defaultValue("mapframe_archive")
+        .build()
+    );
 
     private final Setting<String> webhookUrl = sgGeneral.add(new StringSetting.Builder()
         .name("webhook-url")
@@ -96,11 +109,13 @@ public class MapRgbScanner extends Module {
 
     private static class MapJob {
         final byte[] colors;
-        final String info;
+        final String mapId;
+        final BlockPos pos;
 
-        MapJob(byte[] colors, String info) {
+        MapJob(byte[] colors, String mapId, BlockPos pos) {
             this.colors = colors;
-            this.info = info;
+            this.mapId = mapId;
+            this.pos = pos;
         }
     }
 
@@ -110,6 +125,19 @@ public class MapRgbScanner extends Module {
 
         if (rescanOnEnable.get()) scannedMaps.clear();
 
+        try {
+            Path gameDir = FabricLoader.getInstance().getGameDir();
+            String folder = outputFolder.get().trim().isEmpty() ? "mapframe_archive" : outputFolder.get().trim();
+            Path dbPath = gameDir.resolve(folder).resolve("map_archive.db");
+
+            db = new ScanDb(dbPath);
+            info("Map DB ready: " + dbPath.toAbsolutePath());
+        } catch (Exception e) {
+            e.printStackTrace();
+            warning("Failed to open Map DB. Maps will NOT be saved.");
+            db = null;
+        }
+
         if (webhookUrl.get().isBlank()) {
             warning("Webhook URL is empty. Maps will be scanned but NOT sent.");
         } else if (!looksLikeDiscordWebhook(webhookUrl.get())) {
@@ -117,6 +145,15 @@ public class MapRgbScanner extends Module {
         }
 
         info("Map Scanner enabled.");
+    }
+
+    @Override
+    public void onDeactivate() {
+        super.onDeactivate();
+        if (db != null) {
+            db.close();
+            db = null;
+        }
     }
 
     @EventHandler
@@ -149,48 +186,78 @@ public class MapRgbScanner extends Module {
             int w = 128, h = 128;
             if (colors.length < w * h) continue;
 
-            MapIdComponent idComp = stack.get(DataComponentTypes.MAP_ID);
-            String idText = idComp != null
-                ? FilledMapItem.getIdText(idComp).getString()
-                : "unknown";
+// stack is already a FilledMapItem above, so no need to re-check.
+// But we MUST NOT "return" from inside the loop; use continue.
+
+            MapIdComponent idComp = stack.getComponents().get(DataComponentTypes.MAP_ID);
+            if (idComp == null) continue;
+
+            String idText = "map_" + idComp.id();
+
 
             if (!"unknown".equals(idText) && scannedMaps.contains(idText)) continue;
             if (!"unknown".equals(idText)) scannedMaps.add(idText);
 
             byte[] snapshot = Arrays.copyOf(colors, w * h);
-            String info = "Map " + idText + " at " + frame.getBlockPos().toShortString();
+            BlockPos pos = frame.getBlockPos();
+            jobs.add(new MapJob(snapshot, idText, pos));
 
-            jobs.add(new MapJob(snapshot, info));
             if (jobs.size() >= maxMapsPerScan.get()) break;
         }
 
         if (jobs.isEmpty()) return;
 
         String url = webhookUrl.get().trim();
-        if (url.isEmpty()) {
+        boolean sendDiscord = !url.isEmpty();
+
+        if (!sendDiscord) {
             info("Found " + jobs.size() + " new map(s). (Not sending — webhook-url is blank.)");
-            return;
+        } else {
+            info("Found " + jobs.size() + " new map(s); sending to Discord in background.");
         }
 
-        info("Found " + jobs.size() + " new map(s); sending to Discord in background.");
         EXECUTOR.submit(() -> processJobs(jobs, url));
     }
 
     private int tickCounter = 0;
 
     private void processJobs(List<MapJob> jobs, String url) {
+        int stored = 0;
         int sent = 0;
+
+        String dimension = (mc.world != null && mc.world.getRegistryKey() != null)
+            ? mc.world.getRegistryKey().getValue().toString()
+            : "unknown";
+
+        boolean sendDiscord = url != null && !url.isBlank();
+
         for (MapJob job : jobs) {
             try {
                 BufferedImage img = mapToImage(job.colors);
                 byte[] png = imageToPng(img);
-                DiscordWebhookSender.sendPng(url, png, "map.png", job.info);
-                sent++;
+
+                if (db != null && job.mapId != null && !job.mapId.equals("unknown")) {
+                    db.upsertMap(
+                        job.mapId,
+                        dimension,
+                        job.pos.getX(), job.pos.getY(), job.pos.getZ(),
+                        png,
+                        job.colors
+                    );
+                    stored++;
+                }
+
+                if (sendDiscord) {
+                    String info = "Map " + job.mapId + " at " + job.pos.toShortString();
+                    DiscordWebhookSender.sendPng(url, png, "map.png", info);
+                    sent++;
+                }
             } catch (Exception ex) {
                 ex.printStackTrace();
             }
         }
 
+        if (stored > 0) System.out.println("[MapScanner] Stored " + stored + " map(s) to DB.");
         if (sent > 0) System.out.println("[MapScanner] Sent " + sent + " map(s) to Discord.");
     }
 
